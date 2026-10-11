@@ -1,0 +1,98 @@
+# RunPod GPU Pods; requires the RunPod-enabled pgpu build.
+# Secrets: ROUTER_TOKEN, RUNPOD_API_KEY, NB_API_TOKEN in router environment.
+provider = "runpod"
+
+[router]
+bind_ip = "0.0.0.0" # use only inside an ACL-protected NetBird namespace
+dashboard_port = 8080
+data_dir = "/data-runpod" # MUST NOT reuse an existing Vast database
+wait_for_backend_max_s = 900
+
+[runpod]
+owner_id = "strata-runpod-one" # unique per router; keep stable across restarts
+gpu_type_ids = ["NVIDIA GeForce RTX 5090"]
+cloud_type = "COMMUNITY" # switch to SECURE if its live quote fits your cap
+min_ram_per_gpu = 64
+min_vcpu_per_gpu = 24
+container_disk_gb = 20
+allowed_cuda_versions = ["13.0"]
+# data_center_ids = ["EU-NL-1"]
+max_compute_usd_h = 0.90
+# Conservative local metering estimate, NOT a verified invoice or provider quote.
+# Confirm current running/stopped volume rates in RunPod; storage costs continue
+# while stopped and pod volume data is deleted when the pod is terminated.
+volume_usd_gb_month = 0.20
+
+[netbird]
+api_url = "https://YOUR-NETBIRD-MANAGEMENT"
+management_url = "https://YOUR-NETBIRD-MANAGEMENT"
+groups = ["vast-gpus"] # use an existing group; name can stay for compatibility
+router_nb_ip = "auto"
+router_nb_port = 8080
+
+[budget]
+daily_soft_eur = 2.0
+daily_hard_eur = 2.4
+monthly_eur = 50.0
+usd_per_eur = 1.08
+hard_action = "stop"
+
+[limits]
+max_instances = 1
+max_per_slot = 1
+max_total_rate_usd_h = 1.0 # compute plus conservatively estimated volume rate
+
+[vast]
+# These legacy-named reconciler timers still apply to the selected provider.
+poll_interval_s = 30
+offer_poll_s = 60
+activate_blacklist = false # RunPod offers are GPU types, not individual hosts
+unreachable_stop_after_s = 300
+
+[[slots]]
+id = 1
+role = "llm"
+name = "Strata on RunPod"
+image = "ghcr.io/wasser-quest/strata-pgpu:latest" # publish your rebuilt image first
+mode = "on_demand"
+disk_gb = 150 # persistent pod volume mounted at /workspace
+search_query = "" # Vast query language is intentionally unsupported on RunPod
+passthrough = { 11434 = "api", 11435 = "webui" }
+
+[slots.pool]
+warm = 1
+total = 1
+
+[slots.services]
+api = { port = 8080, health = "/health", busy = "inflight" }
+webui = { port = 8080, health = "/", busy = "inflight" }
+agent = { port = 9100, busy = "none" }
+
+[slots.bid]
+margin = 0.15
+ceiling_usd_h = 0.90 # must match runpod.max_compute_usd_h
+rent_min_usd_h = 0.0
+defend_when_busy = false
+
+[slots.idle]
+stop_after_s = 900
+destroy_after_stopped_s = 172800 # termination deletes the pod's volume!
+
+[slots.swap]
+on_preempt = false
+on_bid_pressure = false
+optimize_cost = false
+max_warmup_s = 7200
+allow_long_downloads = true
+
+[slots.env]
+MODEL_VARIANT = "standard"
+FAMILY = "qwen"
+QUANTIZATION = "IQ2_XS"
+CONTEXT = "32768"
+VISION = "no"
+HOST = "0.0.0.0"
+# STRATA_DATA=/workspace/strata is injected by this provider. Keys are injected
+# per rental; do not override ROUTER_URL, PRAXIS_NODE_TOKEN or NB_SETUP_KEY.
+# Set API_KEY privately if you want a stable Strata client key; the Vast-named
+# image wrapper otherwise generates one. Never commit a real key here.

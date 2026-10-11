@@ -131,6 +131,8 @@ pub async fn patch_config(app: &SharedApp, patch: impl FnOnce(&str) -> anyhow::R
 
 fn apply_config_locked(app: &SharedApp, raw: &str, mut new_cfg: crate::config::Config) -> anyhow::Result<String> {
     let cur = app.cfg();
+    anyhow::ensure!(new_cfg.provider == cur.provider && new_cfg.router.data_dir == cur.router.data_dir, "provider/data_dir changes require a restart and separate data directory");
+    anyhow::ensure!(new_cfg.provider != "runpod" || new_cfg.runpod == cur.runpod, "RunPod provider changes require a router restart");
     // "auto"-Auflösungen der laufenden Config übernehmen (detect läuft nur
     // beim Boot; die laufenden Werte sind bereits real).
     if new_cfg.router.bind_ip == "auto" {

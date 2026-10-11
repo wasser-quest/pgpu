@@ -94,6 +94,20 @@ async fn async_main() -> Result<()> {
     }
     let cfg = &cfg;
     let data_dir = cfg.router.data_dir.clone();
+    std::fs::create_dir_all(&data_dir)?;
+    let marker = data_dir.join("compute-provider.txt");
+    if marker.exists() {
+        anyhow::ensure!(std::fs::read_to_string(&marker)?.trim() == cfg.provider, "compute provider changed: use a separate router.data_dir");
+    } else {
+        anyhow::ensure!(cfg.provider == "vast" || !data_dir.join("pgpu.sqlite").exists(), "RunPod requires a fresh router.data_dir; cannot reuse Vast IDs");
+        std::fs::write(&marker, &cfg.provider)?;
+    }
+    if cfg.provider == "runpod" {
+        let owner_marker = data_dir.join("runpod-owner.txt");
+        if owner_marker.exists() {
+            anyhow::ensure!(std::fs::read_to_string(&owner_marker)?.trim() == cfg.runpod.owner_id, "runpod.owner_id changed; use a new data directory rather than orphaning managed pods");
+        } else { std::fs::write(owner_marker, &cfg.runpod.owner_id)?; }
+    }
     let db = db::Db::open(&data_dir.join("pgpu.sqlite"))?;
     db.init_slots(&cfg)?;
     // Never admit a rental from legacy/cross-version offer pricing. Fresh
@@ -101,15 +115,18 @@ async fn async_main() -> Result<()> {
     db.invalidate_offers()?;
 
     let vast = if !cfg.vast_api_key().is_empty() {
-        match praxis_vast::Vast::new(cfg.vast_api_key()) {
+        let client = if cfg.provider == "runpod" {
+            praxis_vast::Vast::runpod(cfg.vast_api_key(), cfg.runpod.clone())
+        } else { praxis_vast::Vast::new(cfg.vast_api_key()) };
+        match client {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::warn!(%e, "vast client init fehlgeschlagen — Router läuft ohne Vast-API");
+                tracing::warn!(%e, provider = %cfg.provider, "compute provider init failed — dashboard/proxy only");
                 None
             }
         }
     } else {
-        tracing::warn!("VAST_API_KEY nicht gesetzt — nur Proxy/Dashboard aktiv");
+        tracing::warn!(provider = %cfg.provider, "provider API key missing (VAST_API_KEY or RUNPOD_API_KEY) — dashboard/proxy only");
         None
     };
 

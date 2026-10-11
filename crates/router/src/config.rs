@@ -8,6 +8,11 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    /// One compute provider per router/data directory; no mixed-provider IDs.
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub runpod: praxis_vast::runpod::Config,
     #[serde(default)]
     pub router: RouterCfg,
     #[serde(default)]
@@ -438,6 +443,8 @@ fn default_limits() -> LimitsConfig {
     LimitsConfig { max_instances: 3, max_per_slot: 2, max_total_rate_usd_h: 0.60 }
 }
 
+fn default_provider() -> String { "vast".into() }
+
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
@@ -460,6 +467,18 @@ impl Config {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(["vast", "runpod"].contains(&self.provider.as_str()), "provider must be vast or runpod");
+        if self.provider == "runpod" {
+            self.runpod.validate()?;
+            anyhow::ensure!(!self.vast.activate_blacklist, "RunPod GPU-type offers are not hosts; disable vast.activate_blacklist");
+            for slot in &self.slots {
+                anyhow::ensure!(slot.mode == "on_demand", "RunPod supports only on_demand Pods");
+                anyhow::ensure!(slot.search_query.trim().is_empty() && slot.search_query_on_demand.as_deref().unwrap_or("").trim().is_empty(), "RunPod uses runpod.gpu_type_ids/min_*; Vast search queries are unsupported");
+                anyhow::ensure!(slot.location.countries.is_empty() && slot.location.excluded_countries.is_empty() && slot.location.radius_km.is_none(), "RunPod uses data_center_ids; slot location filters unsupported");
+                anyhow::ensure!(slot.bid.ceiling_usd_h == self.runpod.max_compute_usd_h, "RunPod slot ceiling must equal runpod.max_compute_usd_h");
+                anyhow::ensure!(!slot.swap.optimize_cost && !slot.swap.on_bid_pressure, "RunPod price optimization/bid-pressure swaps unsupported");
+            }
+        }
         if self.slots.is_empty() {
             anyhow::bail!("keine Slots konfiguriert");
         }
@@ -571,6 +590,7 @@ impl Config {
     }
 
     pub fn vast_api_key(&self) -> String {
+        if self.provider == "runpod" { return std::env::var("RUNPOD_API_KEY").unwrap_or_default(); }
         std::env::var("VAST_API_KEY").unwrap_or_else(|_| self.vast.api_key.clone())
     }
 
@@ -586,6 +606,27 @@ pub fn router_call_url(cfg: &Config) -> String {
         "ws://{}:{}/api/v1/node",
         cfg.netbird.router_nb_ip, cfg.netbird.router_nb_port
     )
+}
+
+#[cfg(test)]
+mod runpod_tests {
+    use super::*;
+    const EXAMPLE: &str = include_str!("../../../deploy/config.runpod-strata.toml");
+    #[test]
+    fn example_loads_and_selects_runpod() {
+        let config = Config::load_str(EXAMPLE).unwrap();
+        assert_eq!(config.provider, "runpod");
+        assert_eq!(config.runpod.min_vcpu_per_gpu, 24);
+    }
+    #[test]
+    fn vast_filters_are_rejected_for_runpod() {
+        let raw = EXAMPLE.replace("search_query = \"\"", "search_query = \"gpu_ram>=24\"");
+        assert!(Config::load_str(&raw).unwrap_err().to_string().contains("Vast search"));
+    }
+    #[test]
+    fn unknown_provider_is_rejected() {
+        assert!(Config::load_str(&EXAMPLE.replace("provider = \"runpod\"", "provider = \"other\"")).is_err());
+    }
 }
 
 /// Modus-Hilfsanzeige.

@@ -2,6 +2,7 @@
 //! Backoff (Ratelimit-Fehler → Retry).
 
 pub mod query;
+pub mod runpod;
 mod types;
 mod billing;
 pub use billing::{Charge, ChargeMetadata};
@@ -17,6 +18,7 @@ const API_ROOT: &str = "https://console.vast.ai";
 
 #[derive(Clone)]
 pub struct Vast {
+    runpod: Option<runpod::Runpod>,
     key: String,
     http: Client,
     api_root: String,
@@ -25,6 +27,13 @@ pub struct Vast {
 }
 
 impl Vast {
+    pub fn runpod(key: String, cfg: runpod::Config) -> Result<Self> {
+        let backend = runpod::Runpod::new(key, cfg)?;
+        let mut facade = Self::new("")?;
+        facade.runpod = Some(backend);
+        Ok(facade)
+    }
+    pub fn is_runpod(&self) -> bool { self.runpod.is_some() }
     pub fn new(key: impl Into<String>) -> Result<Self> {
         Self::with_api_root(key, API_ROOT)
     }
@@ -40,6 +49,7 @@ impl Vast {
             .build()
             .context("http client")?;
         Ok(Self {
+            runpod: None,
             key: key.into(),
             http,
             api_root: root.trim_end_matches('/').to_string(),
@@ -227,6 +237,7 @@ impl Vast {
 
     /// Parsed predicates shared with caller-side admission/selection validation.
     pub async fn search_filters(&self, filters: serde_json::Map<String, serde_json::Value>, interruptible: bool, allocated_storage_gb: f64) -> Result<Vec<Offer>> {
+        if let Some(provider) = &self.runpod { return provider.offers(interruptible, allocated_storage_gb).await; }
         #[derive(serde::Deserialize)]
         struct Bundles {
             offers: Vec<Offer>,
@@ -280,6 +291,7 @@ impl Vast {
 
     /// Alle Instanzen (`GET /api/v1/instances/`, paginiert).
     pub async fn instances(&self) -> Result<Vec<Instance>> {
+        if let Some(provider) = &self.runpod { return provider.instances().await; }
         #[derive(serde::Deserialize)]
         struct V1 {
             instances: Vec<Instance>,
@@ -309,6 +321,7 @@ impl Vast {
     /// Antwortformat variiert → ID aus allen bekannten Feldern ziehen,
     /// Fallback: eigene Instanzliste nach Label durchsuchen.
     pub async fn create(&self, offer_id: i64, params: &CreateInstanceParams<'_>) -> Result<i64> {
+        if let Some(provider) = &self.runpod { return provider.create(offer_id, params).await; }
         let url = self.url_for(&format!("/asks/{offer_id}/"));
         let mut resp = None;
         for attempt in 0..3 {
@@ -364,6 +377,7 @@ impl Vast {
 
     /// Stoppen/Starten (`PUT /instances/{id}/` mit {"state": ...}, Docs: manage-instance).
     pub async fn set_status(&self, id: i64, running: bool) -> Result<()> {
+        if let Some(provider) = &self.runpod { return provider.set_status(id, running).await; }
         let state = if running { "running" } else { "stopped" };
         self.put_ok(&format!("/instances/{id}/"), &serde_json::json!({ "state": state }))
             .await
@@ -371,6 +385,7 @@ impl Vast {
 
     /// Gebot ändern (`PUT /instances/bid_price/{id}/`, Docs: change-bid).
     pub async fn set_bid(&self, id: i64, price_usd_h: f64) -> Result<()> {
+        anyhow::ensure!(!self.is_runpod(), "RunPod bid changes are not supported");
         self.put_ok(
             &format!("/instances/bid_price/{id}/"),
             &serde_json::json!({ "client_id": "me", "price": price_usd_h }),
@@ -380,16 +395,19 @@ impl Vast {
 
     /// Destroy (`DELETE /instances/{id}/`).
     pub async fn destroy(&self, id: i64) -> Result<()> {
+        if let Some(provider) = &self.runpod { return provider.destroy(id).await; }
         self.delete_ok(&format!("/instances/{id}/")).await
     }
 
     /// Kontostand (`GET /users/current/`) — Ground Truth fürs Metering.
     pub async fn current_user(&self) -> Result<CurrentUser> {
+        anyhow::ensure!(!self.is_runpod(), "RunPod balance endpoint not implemented");
         self.get("/users/current/", &[]).await
     }
 
     /// Instanz-Logs (`PUT /instances/request_logs/{id}/`, dann result_url pollen).
     pub async fn request_logs(&self, id: i64) -> Result<Vec<LogEntry>> {
+        if self.is_runpod() { return Ok(vec![]); }
         #[derive(serde::Deserialize)]
         struct First {
             #[serde(default)]

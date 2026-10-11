@@ -65,6 +65,7 @@ struct Page {
 impl Vast {
     /// Complete immutable result or an error. Never return half an invoice window.
     pub async fn charges(&self, from_unix: i64, through_unix: i64) -> Result<Vec<Charge>> {
+        anyhow::ensure!(!self.is_runpod(), "RunPod invoice reconciliation unavailable; metered ledger preserved");
         ensure!(
             from_unix >= 0 && through_unix >= from_unix,
             "invalid charge date range"

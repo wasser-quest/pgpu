@@ -1,5 +1,10 @@
 # pgpu — Praxis GPU Router
 
+**RunPod GPU Pods (initial backend):** `provider = "runpod"` selects an
+on-demand alternative to Vast. See [setup and limitations](docs/runpod.md) and
+[Strata example config](deploy/config.runpod-strata.toml). Separate router data
+directory required; paid provisioning has not been live-validated.
+
 > **Aktueller Qualitätsstatus:** Kernpfade gehärtet, automatisierte Rust-Tests
 > und isolierte Prozess-/Browser-Smoke-Tests. Noch **keine kommerzielle Freigabe**.
 > Änderungen, Upgrade-Hinweise und konkrete offene Release-Gates:
