@@ -350,6 +350,8 @@ pub struct SlotCfg {
     pub idle: Option<IdleConfig>,
     #[serde(default)]
     pub swap: SwapConfig,
+    #[serde(default)]
+    pub scheduling: SchedulingCfg,
     /// Instanz-Pool (s. praxis_policy::PoolConfig): warm gleichzeitig
     /// laufende Boxen, total Obergrenze inkl. kalter Reserve.
     #[serde(default)]
@@ -374,6 +376,18 @@ fn d_disk() -> i64 {
 }
 fn d_traffic() -> f64 {
     5.0
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SchedulingCfg {
+    /// Seconds since the current start request; zero disables the watchdog.
+    pub after_s: i64,
+    /// none | stop | destroy. stop/destroy also pause the slot's desired state.
+    pub action: String,
+}
+impl Default for SchedulingCfg {
+    fn default() -> Self { Self { after_s: 0, action: "none".into() } }
 }
 
 impl SlotCfg {
@@ -517,6 +531,7 @@ impl Config {
                 crate::selection::query(s,on_demand)
                     .map_err(|e| anyhow::anyhow!("slot {} selection: {e}",s.id))?;
             }
+            anyhow::ensure!(s.scheduling.after_s >= 0 && ["none", "stop", "destroy"].contains(&s.scheduling.action.as_str()), "invalid slot scheduling timeout: after_s >= 0, action none/stop/destroy");
             s.requirements.validate().map_err(anyhow::Error::msg)?;
             s.performance.validate().map_err(anyhow::Error::msg)?;
             if s.performance.benchmark.enabled {

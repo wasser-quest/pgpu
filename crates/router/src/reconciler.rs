@@ -50,7 +50,7 @@ pub async fn run(app: SharedApp) {
 pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
     // Account elapsed time even if the provider inventory request fails.
     meter(app)?;
-    crate::operations::retry_pending(app).await?;
+    crate::operations::retry_non_scheduling_pending(app).await?;
     // 0. Zeitpläne ([[schedule]]-Regeln) — vor allem anderen, damit eine
     //    18:00-Destroy-All-Regel die Boxen weg räumt, bevor der Tick sie
     //    wieder als "soll laufen" betrachtet.
@@ -65,6 +65,9 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
     };
     if let Some(list) = &vast_instances {
         sync_vast(app, list, inventory_requested_at).await?;
+        // Destructive allocation timeouts require a fresh provider observation.
+        crate::operations::retry_scheduling_pending(app).await?;
+        crate::scheduling::enforce(app).await?;
         if let Err(e) = crate::netbird::reconcile(app, list).await {
             tracing::warn!(%e, "NetBird cleanup deferred; will retry without changing live peers");
         }
@@ -186,6 +189,8 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance], inventory_re
     let _lock = app.management.lock().await;
     meter(app)?;
     let by_id: HashMap<i64, &praxis_vast::Instance> = list.iter().map(|i| (i.id, i)).collect();
+    let timeout_pending: Vec<_> = app.db.pending_operations()?.into_iter()
+        .filter(|p|p.2.starts_with("scheduling timeout:")).map(|p|p.0).collect();
     for row in app.db.try_instances(true)? {
         // An in-flight inventory can predate a resume/create. It must not confirm
         // an old run, report preemption, or erase a newly acquired contract.
@@ -209,7 +214,7 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance], inventory_re
         app.db.update_instance_vast(row.vast_id, &v.actual_or("loading"), v.min_bid.unwrap_or(row.min_bid), v.on_demand_compute_usd_h(storage).unwrap_or(row.dph_total), machine_id, v.gpu_or(&row.gpu_name), storage)?;
         // Provider acknowledgement is not always immediate convergence. Retry
         // stopped intent if the next inventory still reports a running GPU.
-        if row.state != "destroyed" && row.intended_status == "stopped" {
+        if row.state != "destroyed" && row.intended_status == "stopped" && !timeout_pending.contains(&row.vast_id) {
             if v.actual_or("") == "running" || v.waiting_for_capacity() {
                 app.db.queue_operation(row.vast_id, "stop", "reconcile: provider still running/queued")?;
             } else if v.actual_or("") == "stopped" {
@@ -595,7 +600,7 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
             .and_then(praxis_policy::schedule::parse_window)
             .map(|w| w.contains(local_weekday, local_minutes))
             .unwrap_or(false);
-        let desired_running = desired_db || warm;
+        let desired_running = (desired_db || warm) && !crate::scheduling::held(app,slot.id)?;
 
         let mut instances = Vec::new();
         for row in rows.iter().filter(|r| r.slot_id == slot.id) {

@@ -531,6 +531,11 @@ impl Db {
         Ok(())
     }
 
+    pub fn cancel_pending_operation(&self, id: i64, reason: &str) -> anyhow::Result<()> {
+        self.0.lock().unwrap().execute("DELETE FROM pending_operations WHERE instance_id=?1 AND reason=?2", params![id,reason])?;
+        Ok(())
+    }
+
     pub fn pending_operations(&self) -> anyhow::Result<Vec<(i64, String, String)>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare("SELECT instance_id,operation,reason FROM pending_operations ORDER BY instance_id")?;

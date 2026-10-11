@@ -1,5 +1,9 @@
 # pgpu — Praxis GPU Router
 
+**Strata verwenden:** [Gesamtanleitung (Deutsch)](docs/STRATA_PGPU.md) — Docker,
+Vast/RunPod, Qwen/Orca, Quantisierung, Suchqueries, Secrets, Monitoring und Praxis.
+[Modell- und Quantisierungsreferenz](docs/strata/PGPU_MODELS.md).
+
 **RunPod GPU Pods (initial backend):** `provider = "runpod"` selects an
 on-demand alternative to Vast. See [setup and limitations](docs/runpod.md) and
 [Strata example config](deploy/config.runpod-strata.toml). Separate router data

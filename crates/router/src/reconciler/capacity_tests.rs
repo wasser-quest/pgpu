@@ -3,6 +3,28 @@ use crate::{hub::HeartbeatData,test_support::{MockProvider,TestApp}};
 use chrono::{Duration,Utc};
 use serde_json::json;
 
+#[tokio::test]
+async fn fresh_inventory_preserves_guarded_scheduling_timeout_intent() {
+    let t=TestApp::new();let p=MockProvider::new().await;p.attach(&t.app);stopped(&t);
+    let mut cfg=(*t.app.cfg()).clone();
+    cfg.slots[0].scheduling.after_s=60;cfg.slots[0].scheduling.action="stop".into();
+    *t.app.cfg.write().unwrap()=std::sync::Arc::new(cfg);
+    t.app.db.set_instance_state(11,"scheduling").unwrap();
+    let conn=rusqlite::Connection::open(t.dir.join("test.sqlite")).unwrap();
+    conn.execute("UPDATE instances SET intended_status='running',boot_started_at=?1 WHERE vast_id=11",[(Utc::now()-Duration::seconds(120)).to_rfc3339()]).unwrap();
+    p.respond(503,"outage");crate::scheduling::enforce(&t.app).await.unwrap();
+    assert_eq!(t.app.db.pending_operations().unwrap().len(),1);
+    observe(&t,&provider("stopped","stopped")).await;
+    let pending=t.app.db.pending_operations().unwrap();
+    assert_eq!(pending.len(),1);
+    assert!(pending[0].2.starts_with("scheduling timeout:"));
+    assert!(t.app.db.pending_respects_lock(11).unwrap());
+    p.respond(200,r#"{"success":true}"#);
+    crate::operations::retry_scheduling_pending(&t.app).await.unwrap();
+    assert_eq!(t.app.db.instance(11).unwrap().state,"stopped");
+    assert!(t.app.db.pending_operations().unwrap().is_empty());
+}
+
 fn provider(actual:&str,cur:&str)->praxis_vast::Instance {
     serde_json::from_value(json!({"id":11,"actual_status":actual,"cur_state":cur,
         "intended_status":"running","dph_base":1.0,"storage_total_cost":0.1})).unwrap()

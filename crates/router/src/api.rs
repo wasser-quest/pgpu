@@ -389,10 +389,25 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
                 }
             }
-            let _ = app.db.set_slot_desired_audited(slot_id, true, "api: wake");
+            {
+                let _lock = app.management.lock().await;
+                if let Err(e) = crate::scheduling::set_hold(&app.0, slot_id, false)
+                    .and_then(|()| app.db.set_slot_desired_audited(slot_id, true, "api: wake")) {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+            }
             app.events.emit(&app.db, "wake", Some(slot_id), None, &reason, &payload);
+            // Retained stopped GPUs get a start request immediately. Do not
+            // invent provider scheduling/health merely because Wake was clicked.
+            let dispatched = crate::operations::wake_existing(&app.0, slot_id, &reason).await;
             app.reconcile_now.notify_one();
-            (StatusCode::OK, "waking").into_response()
+            match dispatched {
+                Ok(_) => (StatusCode::OK, "waking").into_response(),
+                Err(e) => {
+                    app.events.emit(&app.db, "wake_failed", Some(slot_id), None, &e.to_string(), &serde_json::json!({"ready":false}));
+                    (StatusCode::BAD_GATEWAY, format!("wake start failed/unconfirmed: {e}")).into_response()
+                }
+            }
         }
         "sleep" | "stop" => {
             let _ = app.db.set_slot_desired_audited(slot_id, false, "api: sleep")

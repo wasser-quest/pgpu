@@ -28,6 +28,11 @@ mod test_support;
 #[cfg(test)]
 mod regressions;
 #[cfg(test)]
+mod wake_tests;
+mod scheduling;
+#[cfg(test)]
+mod scheduling_tests;
+#[cfg(test)]
 mod performance_tests;
 mod proxy;
 mod reconciler;

@@ -85,6 +85,13 @@ optimize_cost = false
 max_warmup_s = 7200
 allow_long_downloads = true
 
+# Optional allocation-wait watchdog; disabled by default.
+# stop retains the volume (storage billing continues); destroy deletes pod/data.
+# Both hold the entire slot until explicit Wake, including scheduled/warm hours.
+# [slots.scheduling]
+# after_s = 1800
+# action = "stop" # none | stop | destroy
+
 [slots.env]
 MODEL_VARIANT = "standard"
 FAMILY = "qwen"

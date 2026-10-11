@@ -56,11 +56,16 @@ async fn request(app: &SharedApp, id: i64, operation: &str, reason: &str, origin
     if inst.destroyed_at.is_some() { return Ok(()); }
     if origin!=Origin::Explicit {check_lock(app,inst.slot_id,Some(&inst))?;}
     if origin==Origin::Policy {
+        if reason.starts_with("scheduling timeout:") {
+            crate::scheduling::check(app, &inst, operation, chrono::Utc::now())?;
+            anyhow::ensure!(!app.db.pending_operations()?.iter().any(|p|p.0==id),"cleanup already pending");
+        }
         if reason.starts_with("unreachable:") {
             anyhow::ensure!(inst.state=="unreachable" && inst.actual_status=="running","stale unreachable stop");
         }
         anyhow::ensure!(operation!="destroy" || !inst.phase().awaiting_allocation()
-            || reason.starts_with("budget hard cap:") || reason.starts_with("lifecycle ("),
+            || reason.starts_with("budget hard cap:") || reason.starts_with("lifecycle (")
+            || reason.starts_with("scheduling timeout:"),
             "capacity wait/unconfirmed start cannot destroy a retained disk");
         if operation=="destroy" {
             if reason.contains("warmup timeout") || reason.contains("swap_failed") {check_warmup_cleanup(app,&inst)?;}
@@ -77,6 +82,11 @@ async fn request(app: &SharedApp, id: i64, operation: &str, reason: &str, origin
     }
     // Persist before I/O. Never mark completed or stop metering on a failed request.
     app.db.queue_operation_guarded(id, operation, reason,origin!=Origin::Explicit)?;
+    if origin==Origin::Policy && reason.starts_with("scheduling timeout:") {
+        crate::scheduling::set_hold(app, inst.slot_id, true)?;
+        app.db.set_slot_desired_audited(inst.slot_id, false, reason)?;
+        app.events.emit(&app.db,"scheduling_timeout",Some(inst.slot_id),Some(id),reason,&serde_json::json!({"action":operation,"slot_paused":true}));
+    }
     app.reconcile_now.notify_one();
     for (pending_id, op, why) in app.db.pending_operations()? {
         if pending_id == id { return execute(app, id, &op, &why).await; }
@@ -85,8 +95,21 @@ async fn request(app: &SharedApp, id: i64, operation: &str, reason: &str, origin
 }
 
 pub async fn retry_pending(app: &SharedApp) -> anyhow::Result<()> {
+    retry_pending_kind(app, None).await
+}
+
+pub async fn retry_non_scheduling_pending(app: &SharedApp) -> anyhow::Result<()> {
+    retry_pending_kind(app, Some(false)).await
+}
+
+pub async fn retry_scheduling_pending(app: &SharedApp) -> anyhow::Result<()> {
+    retry_pending_kind(app, Some(true)).await
+}
+
+async fn retry_pending_kind(app: &SharedApp, scheduling_only: Option<bool>) -> anyhow::Result<()> {
     let _lock = app.management.lock().await;
     for (id, op, reason) in app.db.pending_operations()? {
+        if scheduling_only.is_some_and(|only| only != reason.starts_with("scheduling timeout:")) {continue;}
         if let Err(e) = execute(app, id, &op, &reason).await {
             tracing::warn!(id, operation = %op, %e, "provider operation remains pending");
         }
@@ -97,6 +120,17 @@ pub async fn retry_pending(app: &SharedApp) -> anyhow::Result<()> {
 async fn execute(app: &SharedApp, id: i64, op: &str, reason: &str) -> anyhow::Result<()> {
     let inst = app.db.instance(id).ok_or_else(|| anyhow::anyhow!("unknown instance {id}"))?;
     if app.db.pending_respects_lock(id)? {check_lock(app,inst.slot_id,Some(&inst))?;}
+    if reason.starts_with("scheduling timeout:") {
+        crate::scheduling::set_hold(app,inst.slot_id,true)?;
+        app.db.set_slot_desired_audited(inst.slot_id,false,reason)?;
+        if crate::scheduling::check(app,&inst,op,chrono::Utc::now()).is_err() {
+            app.db.cancel_pending_operation(id,reason)?;
+            app.events.emit(&app.db,"scheduling_timeout_cancelled",Some(inst.slot_id),Some(id),"allocation/config changed; cleanup cancelled; slot remains paused",&serde_json::json!({}));
+            return Ok(());
+        }
+        // Also restore the pause after a crash between intent and desired-state writes.
+        app.db.set_slot_desired_audited(inst.slot_id,false,reason)?;
+    }
     let vast = app.vast.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("vast api not configured"))?;
     match op {
         "destroy" => vast.destroy(id).await?,
@@ -172,6 +206,7 @@ pub fn check_admission(app: &SharedApp, slot: i64, rate: f64, storage: f64, exis
 }
 
 pub fn check_admission_with_startup(app: &SharedApp, slot: i64, rate: f64, storage: f64, existing: Option<i64>, startup_cost: f64) -> anyhow::Result<()> {
+    anyhow::ensure!(!crate::scheduling::held(app,slot)?,"slot paused by scheduling timeout; explicit wake required");
     anyhow::ensure!(startup_cost.is_finite() && startup_cost >= 0.0, "invalid startup cost");
     anyhow::ensure!(!app.shutting_down.load(std::sync::atomic::Ordering::Relaxed), "router is shutting down");
     anyhow::ensure!(rate.is_finite() && rate > 0.0 && storage.is_finite() && storage >= 0.0, "invalid hourly rate");
@@ -228,14 +263,34 @@ async fn change_bid_impl(app: &SharedApp, id: i64, price: f64, reason: &str, aut
 }
 
 pub async fn start_instance(app: &SharedApp, id: i64, reason: &str) -> anyhow::Result<()> {
-    start(app, id, reason, false).await
+    start(app, id, reason, false, false).await
 }
 
 pub async fn start_automatic_instance(app: &SharedApp, id: i64, reason: &str) -> anyhow::Result<()> {
-    start(app, id, reason, true).await
+    start(app, id, reason, true, false).await
 }
 
-async fn start(app: &SharedApp, id: i64, reason: &str, automatic: bool) -> anyhow::Result<()> {
+/// Explicit slot wake dispatches retained instances immediately rather than
+/// waiting for the next inventory/search tick. New rentals still use policy.
+pub async fn wake_existing(app: &SharedApp, slot_id: i64, reason: &str) -> anyhow::Result<usize> {
+    let cfg = app.cfg();
+    let warm = cfg.slot(slot_id).ok_or_else(|| anyhow::anyhow!("unknown slot"))?.pool.warm;
+    let rows: Vec<_> = app.db.try_instances(false)?.into_iter().filter(|r| r.slot_id == slot_id).collect();
+    let active = rows.iter().filter(|r| r.phase().is_active() && r.state != "start_failed").count();
+    let mut candidates: Vec<_> = rows.into_iter().filter(|r| {
+        matches!(r.state.as_str(), "stopped" | "start_failed")
+            && r.mode != praxis_common::Mode::Manual && !r.pinned
+    }).collect();
+    candidates.sort_by_key(|r| std::cmp::Reverse(r.vast_id));
+    let mut dispatched = 0;
+    for row in candidates.into_iter().take(warm.saturating_sub(active)) {
+        start(app, row.vast_id, reason, true, true).await?;
+        dispatched += 1;
+    }
+    Ok(dispatched)
+}
+
+async fn start(app: &SharedApp, id: i64, reason: &str, automatic: bool, explicit_wake: bool) -> anyhow::Result<()> {
     let _lock = app.management.lock().await;
     anyhow::ensure!(!automatic || app.db.auto_rent_enabled(), "auto-rent disabled");
     let inst = app.db.instance(id).ok_or_else(|| anyhow::anyhow!("unknown instance {id}"))?;
@@ -247,7 +302,11 @@ async fn start(app: &SharedApp, id: i64, reason: &str, automatic: bool) -> anyho
     anyhow::ensure!(!app.db.pending_operations()?.iter().any(|p| p.0 == id), "instance {id} has a pending stop/destroy");
     // An accepted queue request is idempotent. Explicit retry remains available
     // for an unconfirmed start, never through replacement/disk destruction.
-    if inst.phase().awaiting_allocation() && (automatic || !matches!(inst.state.as_str(),"start_requested"|"start_failed")) {return Ok(());}
+    if inst.phase().awaiting_allocation() {
+        let explicit_retry = (!automatic && matches!(inst.state.as_str(), "start_requested" | "start_failed"))
+            || (explicit_wake && inst.state == "start_failed");
+        if !explicit_retry { return Ok(()); }
+    }
     crate::reconciler::meter(app)?;
     let rate = if inst.mode == praxis_common::Mode::Interruptible { inst.bid_usd_h } else { inst.dph_total };
     crate::catalog::check_resume(app, &inst, rate)?;
